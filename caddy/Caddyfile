@@ -1,0 +1,43 @@
+# KRUMAQ-COPILOT — Caddyfile
+#
+# Caddy automatically provisions and renews TLS certificates.
+#
+# LAN / localhost usage (self-signed, trusted via mkcert or browser exception):
+#   Set KRUMAQ_DOMAIN=krumaq.localhost in .env and access from the same machine.
+#
+# Public domain (auto Let's Encrypt):
+#   Set KRUMAQ_DOMAIN=krumaq.yourdomain.com, ensure port 80/443 are reachable,
+#   and Caddy will obtain a certificate automatically.
+#
+# Tailscale / private network:
+#   Use your Tailscale MagicDNS hostname, e.g. my-server.tail1234.ts.net
+
+{KRUMAQ_DOMAIN:krumaq.localhost} {
+
+    # Reverse-proxy all traffic to Open WebUI
+    reverse_proxy open-webui:8080 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+
+    # Security headers
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        -Server
+    }
+
+    # Compress responses
+    encode zstd gzip
+
+    # Logging
+    log {
+        output stdout
+        format console
+        level INFO
+    }
+}
