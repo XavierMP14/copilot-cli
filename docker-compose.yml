@@ -1,0 +1,89 @@
+# KRUMAQ-COPILOT — Docker Compose Stack
+# Services: Ollama (LLM backend) + Open WebUI (chat interface) + Caddy (HTTPS reverse proxy)
+#
+# Quick start:
+#   1. Copy .env.example to .env and edit as needed
+#   2. docker compose up -d
+#   3. Open https://krumaq.localhost (or your configured domain) in your browser
+#   4. Pull a model: docker exec -it krumaq-ollama ollama pull llama3.2
+#
+# GPU support: uncomment the `deploy` block under the ollama service (requires nvidia-container-toolkit)
+
+name: krumaq-copilot
+
+services:
+
+  # ── LLM Backend ──────────────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: krumaq-ollama
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:11434:11434"   # bind to localhost only; Caddy proxies externally
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:-24h}
+      - OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-2}
+    # Uncomment the block below to enable NVIDIA GPU passthrough.
+    # Requires: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  # ── Web Chat UI ───────────────────────────────────────────────────────────────
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: krumaq-webui
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+    expose:
+      - "8080"
+    volumes:
+      - webui_data:/app/backend/data
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - WEBUI_NAME=${WEBUI_NAME:-KRUMAQ-COPILOT}
+      - WEBUI_URL=${WEBUI_URL:-https://krumaq.localhost}
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:?Please set WEBUI_SECRET_KEY in your .env file — run: openssl rand -hex 32}
+      - DEFAULT_MODELS=${DEFAULT_MODELS:-llama3.2}
+      - ENABLE_SIGNUP=${ENABLE_SIGNUP:-false}
+      - ENABLE_LOGIN_FORM=${ENABLE_LOGIN_FORM:-true}
+
+  # ── HTTPS Reverse Proxy ───────────────────────────────────────────────────────
+  caddy:
+    image: caddy:2-alpine
+    container_name: krumaq-caddy
+    restart: unless-stopped
+    depends_on:
+      - open-webui
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  ollama_data:
+    name: krumaq_ollama_data
+  webui_data:
+    name: krumaq_webui_data
+  caddy_data:
+    name: krumaq_caddy_data
+  caddy_config:
+    name: krumaq_caddy_config

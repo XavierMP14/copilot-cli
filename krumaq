@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# KRUMAQ-COPILOT CLI — terminal interface for your local AI
+#
+# Talks directly to your Ollama instance.  No cloud, no tokens, no cost.
+#
+# Usage:
+#   krumaq [OPTIONS] [PROMPT]
+#   krumaq                        # interactive chat (REPL)
+#   krumaq "explain this code"    # single prompt, prints reply and exits
+#   krumaq --model phi3 "hi"      # choose a specific model
+#   krumaq --list                 # list locally available models
+#   krumaq --pull llama3.2        # pull a model from the Ollama registry
+#   krumaq --version              # print version information
+#
+# Environment variables:
+#   KRUMAQ_HOST    Ollama base URL  (default: http://localhost:11434)
+#   KRUMAQ_MODEL   Default model   (default: llama3.2)
+
+set -euo pipefail
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+KRUMAQ_VERSION="1.0.0"
+KRUMAQ_HOST="${KRUMAQ_HOST:-http://localhost:11434}"
+KRUMAQ_MODEL="${KRUMAQ_MODEL:-llama3.2}"
+HISTORY_FILE="${HOME}/.krumaq_history"
+
+# ── Colour helpers ────────────────────────────────────────────────────────────
+BYTES_PER_GB=1073741824   # 1024^3 bytes
+
+if [ -t 1 ] && command -v tput >/dev/null 2>&1; then
+  BOLD="$(tput bold)"
+  DIM="$(tput dim 2>/dev/null || echo "")"
+  CYAN="$(tput setaf 6)"
+  GREEN="$(tput setaf 2)"
+  YELLOW="$(tput setaf 3)"
+  RED="$(tput setaf 1)"
+  RESET="$(tput sgr0)"
+else
+  BOLD="" DIM="" CYAN="" GREEN="" YELLOW="" RED="" RESET=""
+fi
+
+# ── Dependency check ──────────────────────────────────────────────────────────
+_require() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "${RED}Error:${RESET} '$1' is required but not installed." >&2
+    exit 1
+  fi
+}
+_require curl
+_require jq
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+_ollama_running() {
+  curl -sf --max-time 2 "${KRUMAQ_HOST}/api/tags" >/dev/null 2>&1
+}
+
+_check_ollama() {
+  if ! _ollama_running; then
+    echo "${RED}Error:${RESET} Ollama is not reachable at ${KRUMAQ_HOST}" >&2
+    echo "  • Start it with:  docker compose up -d ollama" >&2
+    echo "  • Or install locally: https://ollama.com/download" >&2
+    exit 1
+  fi
+}
+
+_banner() {
+  echo "${BOLD}${CYAN}"
+  cat <<'EOF'
+  ██╗  ██╗██████╗ ██╗   ██╗███╗   ███╗ █████╗  ██████╗
+  ██║ ██╔╝██╔══██╗██║   ██║████╗ ████║██╔══██╗██╔═══██╗
+  █████╔╝ ██████╔╝██║   ██║██╔████╔██║███████║██║   ██║
+  ██╔═██╗ ██╔══██╗██║   ██║██║╚██╔╝██║██╔══██║██║▄▄ ██║
+  ██║  ██╗██║  ██║╚██████╔╝██║ ╚═╝ ██║██║  ██║╚██████╔╝
+  ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝╚═╝  ╚═╝ ╚══▀▀═╝
+EOF
+  echo "  ${GREEN}COPILOT${RESET}${CYAN} — Your personal AI, fully self-hosted.${RESET}"
+  echo ""
+}
+
+# ── Single-turn prompt (streaming) ────────────────────────────────────────────
+_ask() {
+  local model="$1"
+  local prompt="$2"
+  local messages="$3"   # JSON array of prior messages (for REPL context)
+
+  local payload
+  payload=$(jq -nc \
+    --arg model "$model" \
+    --arg prompt "$prompt" \
+    --argjson messages "$messages" \
+    '{model: $model, messages: ($messages + [{role:"user", content:$prompt}]), stream: true}')
+
+  printf "%s" "${GREEN}"
+  curl -sf --no-buffer \
+    -H "Content-Type: application/json" \
+    -d "$payload" \
+    "${KRUMAQ_HOST}/api/chat" \
+  | while IFS= read -r line; do
+      content=$(echo "$line" | jq -r '.message.content // empty' 2>/dev/null)
+      [ -n "$content" ] && printf "%s" "$content"
+    done
+  printf "%s\n" "${RESET}"
+}
+
+# ── List available models ──────────────────────────────────────────────────────
+_list_models() {
+  _check_ollama
+  echo "${BOLD}Available models on ${KRUMAQ_HOST}:${RESET}"
+  curl -sf "${KRUMAQ_HOST}/api/tags" \
+    | jq -r --argjson bpg "$BYTES_PER_GB" '.models[] | "  • \(.name)  (\(.size / $bpg | floor))GB  modified: \(.modified_at[:10])"' \
+    2>/dev/null \
+  || echo "  (no models found — run: krumaq --pull llama3.2)"
+}
+
+# ── Pull a model ───────────────────────────────────────────────────────────────
+_pull_model() {
+  local model="$1"
+  _check_ollama
+  echo "Pulling ${BOLD}${model}${RESET} — this may take a while..."
+  curl -sf \
+    -H "Content-Type: application/json" \
+    -d "{\"name\": \"${model}\"}" \
+    "${KRUMAQ_HOST}/api/pull" \
+  | while IFS= read -r line; do
+      status=$(echo "$line" | jq -r '.status // empty' 2>/dev/null)
+      [ -n "$status" ] && printf "\r  %s%-60s" "${DIM}" "$status"
+    done
+  echo ""
+  echo "${GREEN}✓${RESET} Model '${model}' ready."
+}
+
+# ── Interactive REPL ───────────────────────────────────────────────────────────
+_repl() {
+  local model="$1"
+  _check_ollama
+  _banner
+  echo "${BOLD}Model:${RESET} ${model}  |  ${BOLD}Host:${RESET} ${KRUMAQ_HOST}"
+  echo "${DIM}Commands: /model <name>  /list  /pull <name>  /clear  /exit${RESET}"
+  echo ""
+
+  local messages="[]"
+
+  # Enable readline history if available
+  if command -v rlwrap >/dev/null 2>&1; then
+    exec rlwrap -H "$HISTORY_FILE" "$0" --repl-inner "$model"
+  fi
+
+  while true; do
+    printf "${BOLD}${CYAN}you>${RESET} "
+    IFS= read -r input || { echo ""; break; }
+
+    [ -z "$input" ] && continue
+
+    case "$input" in
+      /exit|/quit|exit|quit)
+        echo "Goodbye."
+        break
+        ;;
+      /clear)
+        messages="[]"
+        echo "${DIM}Context cleared.${RESET}"
+        continue
+        ;;
+      /list)
+        _list_models
+        continue
+        ;;
+      /pull\ *)
+        _pull_model "${input#/pull }"
+        continue
+        ;;
+      /model\ *)
+        model="${input#/model }"
+        echo "${DIM}Switched to model: ${model}${RESET}"
+        continue
+        ;;
+      /help|/?)
+        echo "  /model <name>  — switch model"
+        echo "  /list          — list available models"
+        echo "  /pull <name>   — pull a model (e.g. /pull deepseek-coder)"
+        echo "  /clear         — clear conversation context"
+        echo "  /exit          — quit"
+        continue
+        ;;
+    esac
+
+    # Save user turn to history
+    echo "$input" >> "$HISTORY_FILE" 2>/dev/null || true
+
+    printf "${BOLD}${CYAN}krumaq>${RESET} "
+    local reply
+    reply=$(_ask "$model" "$input" "$messages")
+    echo "$reply"
+
+    # Append both turns to context for multi-turn conversation
+    messages=$(echo "$messages" | jq \
+      --arg user "$input" \
+      --arg assistant "$reply" \
+      '. + [{role:"user",content:$user},{role:"assistant",content:$assistant}]')
+  done
+}
+
+# ── Argument parsing ───────────────────────────────────────────────────────────
+usage() {
+  cat <<EOF
+${BOLD}KRUMAQ-COPILOT CLI ${KRUMAQ_VERSION}${RESET}
+Your personal AI assistant, 100% self-hosted.
+
+${BOLD}Usage:${RESET}
+  krumaq [OPTIONS] [PROMPT]
+
+${BOLD}Options:${RESET}
+  -m, --model <name>   Model to use (default: \$KRUMAQ_MODEL or llama3.2)
+  -H, --host  <url>    Ollama host   (default: \$KRUMAQ_HOST or http://localhost:11434)
+      --list           List locally available models
+      --pull <name>    Pull a model from the Ollama registry
+      --version        Print version
+  -h, --help           Show this help
+
+${BOLD}Examples:${RESET}
+  krumaq                                  # interactive chat
+  krumaq "write a Python hello world"     # one-shot prompt
+  krumaq --model deepseek-coder "refactor this function: \$(cat main.py)"
+  krumaq --list
+  krumaq --pull phi3
+
+${BOLD}Environment:${RESET}
+  KRUMAQ_HOST   Ollama base URL (default: http://localhost:11434)
+  KRUMAQ_MODEL  Default model   (default: llama3.2)
+EOF
+}
+
+MODEL="$KRUMAQ_MODEL"
+PROMPT=""
+ACTION="repl"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)    usage; exit 0 ;;
+    --version)    echo "krumaq ${KRUMAQ_VERSION}"; exit 0 ;;
+    --list)       ACTION="list"; shift ;;
+    --pull)       ACTION="pull"; shift; PULL_MODEL="${1:-}"; shift ;;
+    -m|--model)   shift; MODEL="${1:-$MODEL}"; shift ;;
+    -H|--host)    shift; KRUMAQ_HOST="${1:-$KRUMAQ_HOST}"; shift ;;
+    --repl-inner) shift; MODEL="${1:-$MODEL}"; ACTION="repl-inner"; shift ;;
+    --)           shift; PROMPT="$*"; break ;;
+    -*)           echo "${RED}Unknown option:${RESET} $1" >&2; usage >&2; exit 1 ;;
+    *)            PROMPT="${PROMPT:+$PROMPT }$1"; shift ;;
+  esac
+done
+
+case "$ACTION" in
+  list)       _list_models ;;
+  pull)       _pull_model "${PULL_MODEL:-}" ;;
+  repl-inner) _repl "$MODEL" ;;
+  repl)
+    if [ -n "$PROMPT" ]; then
+      _check_ollama
+      _ask "$MODEL" "$PROMPT" "[]"
+    else
+      _repl "$MODEL"
+    fi
+    ;;
+esac
